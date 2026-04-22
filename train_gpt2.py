@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+from numpy import dtype
 from torch.nn import functional as F
 import os
 from pathlib import Path
@@ -104,6 +105,21 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    def forward(self, idx):
+        B,T = idx.size()
+        assert T <= self.config.block_size, f"cannot forward sequance length of {T}"
+        pos = torch.arange(0, T, dtype= torch.long, device= idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = tok_emb + pos_emb
+        # forward the block of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        #forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)# (B, T, vocab_size)
+        return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
 
@@ -127,16 +143,7 @@ class GPT(nn.Module):
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask/buffer
 
-        #To use the local GPT2 version i have to specify the path
-        Model_map = {
-            'gpt2': 'gpt2',
-            'gpt2_medium': 'gpt2-medium',
-            'gpt2_large': 'gpt2-large',
-            'gpt2_xl': 'gpt2-xl'
-        }
-
-        model_name = Model_map[model_type]
-        model_path = get_local_model_path(model_name)
+        model_path = get_local_model_path(model_type) #To use the local GPT2 version i have to specify the path
         model_hf = GPT2LMHeadModel.from_pretrained(model_path, local_files_only=True)
         sd_hf = model_hf.state_dict()
 
@@ -162,7 +169,18 @@ class GPT(nn.Module):
 
         return model
 
-
+num_return_sequense = 5
+max_length = 30
 
 model =GPT.from_pretrained('gpt2')
-print('it worked')
+model.eval()
+model.to('cuda')
+print("worked")
+
+from transformers import  GPT2Tokenizer
+enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
+tokens = enc.encode("I play electric guitar")
+tokens = torch.tensor(tokens, dtype= torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequense,1)
+x = tokens.to('cuda')
+print(x)
