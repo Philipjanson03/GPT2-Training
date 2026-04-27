@@ -52,9 +52,9 @@ class CasualSelfAttention(nn.Module):
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim = 2)
 
-        k = k.view(B,T, self.n_head, C//self.n_head)
-        q = q.view(B,T, self.n_head, C//self.n_head)
-        v = v.view(B,T, self.n_head, C//self.n_head)
+        k = k.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
+        q = q.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
+        v = v.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
         att = (q @ k.transpose(-2,-1)) * (1 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
@@ -169,7 +169,8 @@ class GPT(nn.Module):
 
         return model
 
-num_return_sequense = 5
+
+num_return_sequences = 5
 max_length = 30
 
 model =GPT.from_pretrained('gpt2')
@@ -181,6 +182,31 @@ from transformers import  GPT2Tokenizer
 enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
 tokens = enc.encode("I play electric guitar")
 tokens = torch.tensor(tokens, dtype= torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequense,1)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
 x = tokens.to('cuda')
-print(x)
+
+# x is (B,T) where B = 5 and T = 8
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get logits
+    with torch.no_grad():
+        logits = model(x)
+        # take the logits at the last position
+        logits = logits[:, -1, :]
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default) we keep top 50 this way we insure the model doesn't go off rails so easily
+        topk_probs , topk_indices = torch.topk(probs, 50, dim= -1)
+        # select a token from top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim= 1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i,:max_length].tolist()
+    decode = enc.decode(tokens)
+    print(">",decode)
