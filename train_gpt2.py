@@ -6,7 +6,7 @@ from numpy import dtype
 from torch.nn import functional as F
 import os
 from pathlib import Path
-
+from transformers import GPT2Tokenizer
 
 def get_local_model_path(model_name):
     hf_home = Path(os.environ.get('HF_HOME', Path.home() / '.cache' / 'huggingface'))
@@ -105,7 +105,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets = None):
         B,T = idx.size()
         assert T <= self.config.block_size, f"cannot forward sequance length of {T}"
         pos = torch.arange(0, T, dtype= torch.long, device= idx.device)
@@ -118,7 +118,10 @@ class GPT(nn.Module):
         #forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)# (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -173,17 +176,45 @@ class GPT(nn.Module):
 num_return_sequences = 5
 max_length = 30
 
-model =GPT.from_pretrained('gpt2')
+device = "cpu"
+
+# get a data batch
+if torch.cuda.is_available():
+    device = "cuda"
+enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B,T = 4 , 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B,T).to(device)
+y = buf[1:].view(B,T).to(device)
+
+# model =GPT.from_pretrained('gpt2')
+model = GPT(GPT2Config())
+model.to(device)
+#optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Step{i} the Loss is : {loss.item()}")
+
+import sys; sys.exit(0)
+
+
 model.eval()
-model.to('cuda')
-print("worked")
+
 
 from transformers import  GPT2Tokenizer
 enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
 tokens = enc.encode("I play electric guitar")
 tokens = torch.tensor(tokens, dtype= torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 # x is (B,T) where B = 5 and T = 8
 torch.manual_seed(42)
