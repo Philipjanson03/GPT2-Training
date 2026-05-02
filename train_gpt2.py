@@ -205,7 +205,7 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f'Loaded: {len(self.tokens)} tokens')
-        print(f'an epoch {len(self.tokens)// (B * T)} batches')
+        print(f'an epoch {len(self.tokens)// (accumulation_steps * B * T)} batches')
 
         # state
         self.current_position = 0
@@ -224,6 +224,10 @@ class DataLoaderLite:
 
 num_return_sequences = 5
 max_length = 30
+# to simulate the batch 16 or 64 or etc but still not getting the OOM error
+accumulation_steps = 4
+
+import time
 
 device = "cpu"
 # get a data batch
@@ -234,7 +238,7 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(4,32)
+train_loader = DataLoaderLite(4,1024)
 
 # model =GPT.from_pretrained('gpt2')
 model = GPT(GPT2Config())
@@ -242,13 +246,25 @@ model.to(device)
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
-    x , y = train_loader.next_batch()
-    x , y = x.to(device), y.to(device)
+    t0 = time.time()
     optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
+
+    loss_accum = 0.0
+    for _ in range(accumulation_steps):
+        x , y = train_loader.next_batch()
+        x , y = x.to(device), y.to(device)
+        with torch.autocast(device_type= device, dtype= torch.bfloat16):
+            logits, loss = model(x, y)
+            # scaling the loss and in the loss_accum it will be added "accumulation_steps" times
+        loss = loss / accumulation_steps
+        loss_accum += loss.detach()
+        loss.backward()
     optimizer.step()
-    print(f"Step{i} the Loss is : {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    print(f"Step{i} the Loss is : {loss_accum.item()} , dt : {dt:.2f} ms")
+
 
 import sys; sys.exit(0)
 
@@ -269,7 +285,7 @@ torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     # forward the model to get logits
     with torch.no_grad():
-        logits = model(x)
+        logits,_ = model(x)
         # take the logits at the last position
         logits = logits[:, -1, :]
         # get the probabilities
