@@ -8,6 +8,19 @@ import os
 from pathlib import Path
 from transformers import GPT2Tokenizer
 
+import torch._inductor.config as inductor_config
+
+# Fix Windows filesystem race conditions
+inductor_config.coordinate_descent_tuning = False
+inductor_config.fx_graph_cache = False
+inductor_config.max_autotune = False
+inductor_config.shape_padding = False
+
+# Performance improvements
+inductor_config.triton.cudagraphs = True  # Enable CUDA graphs for kernel fusion
+inductor_config.epilogue_fusion = True  # Fuse epilogue operations
+inductor_config.pattern_matcher = True  # Enable pattern matching optimizations
+
 def get_local_model_path(model_name):
     hf_home = Path(os.environ.get('HF_HOME', Path.home() / '.cache' / 'huggingface'))
     model_cache = hf_home / 'hub' / f'models--{model_name.replace("/", "--")}'
@@ -239,21 +252,24 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 train_loader = DataLoaderLite(4,1024)
-
+torch.set_float32_matmul_precision('high')
 # model =GPT.from_pretrained('gpt2')
 model = GPT(GPT2Config())
+print(device)
 model.to(device)
+
+model = torch.compile(model)
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
+for i in range(5):
     t0 = time.time()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     loss_accum = 0.0
     for _ in range(accumulation_steps):
         x , y = train_loader.next_batch()
         x , y = x.to(device), y.to(device)
-        with torch.autocast(device_type= device, dtype= torch.bfloat16):
+        with torch.amp.autocast(device_type= device, dtype= torch.bfloat16):
             logits, loss = model(x, y)
             # scaling the loss and in the loss_accum it will be added "accumulation_steps" times
         loss = loss / accumulation_steps
@@ -263,7 +279,8 @@ for i in range(50):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    print(f"Step{i} the Loss is : {loss_accum.item()} , dt : {dt:.2f} ms")
+    tokens_per_sec = (accumulation_steps * train_loader.B * train_loader.T) / (dt/1000)
+    print(f"Step{i} the Loss is : {loss_accum.item()} , dt : {dt:.2f} ms tokens / sec : {tokens_per_sec}")
 
 
 import sys; sys.exit(0)
