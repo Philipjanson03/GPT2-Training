@@ -234,11 +234,25 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+def get_lr (step, max_steps, max_lr,min_lr,warmup_steps):
+    if step <  warmup_steps:
+        return max_lr * ((step + 1) / warmup_steps)
+    elif step >= max_steps:
+        return min_lr
+    else:
+        decay_ratio =  (step - warmup_steps) / (max_steps - warmup_steps)
+        coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
+
 
 num_return_sequences = 5
 max_length = 30
 # to simulate the batch 16 or 64 or etc but still not getting the OOM error
 accumulation_steps = 4
+max_steps = 50
+max_lr = 3e-4
+min_lr = 3e-5
+warmup_steps = max(1, max_steps // 10)
 
 import time
 
@@ -260,8 +274,12 @@ model.to(device)
 
 model = torch.compile(model)
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
-for i in range(5):
+optimizer = torch.optim.AdamW(model.parameters(), lr = max_lr, fused=True)
+for i in range(max_steps):
+    lr = get_lr(i, max_steps, max_lr, min_lr, warmup_steps)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
 
