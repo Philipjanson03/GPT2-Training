@@ -11,8 +11,8 @@ from transformers import GPT2Tokenizer
 import torch._inductor.config as inductor_config
 
 # Fix Windows filesystem race conditions
-inductor_config.coordinate_descent_tuning = False
-inductor_config.fx_graph_cache = False
+inductor_config.coordinate_descent_tuning = True
+inductor_config.fx_graph_cache = True
 inductor_config.max_autotune = False
 inductor_config.shape_padding = False
 
