@@ -70,10 +70,13 @@ class CasualSelfAttention(nn.Module):
         q = q.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         v = v.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2,-1)) * (1 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = -1)
-        y = att @ v
+        # att = (q @ k.transpose(-2,-1)) * (1 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = -1)
+        # y = att @ v
+        # -- flash attention : this method makes it so there's no reads/writes to HBM and everything is happening i shared memory because of online softmax calculation
+        y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
+
         y = y.transpose(1,2).contiguous().view(B,T,C)# reassemble all the head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -250,8 +253,8 @@ max_length = 30
 # to simulate the batch 16 or 64 or etc but still not getting the OOM error
 accumulation_steps = 4
 max_steps = 50
-max_lr = 3e-4
-min_lr = 3e-5
+max_lr = 6e-4
+min_lr = max_lr * 0.1
 warmup_steps = max(1, max_steps // 10)
 
 import time
