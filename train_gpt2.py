@@ -8,6 +8,19 @@ import os
 from pathlib import Path
 from transformers import GPT2Tokenizer
 
+import torch._inductor.config as inductor_config
+
+# Fix Windows filesystem race conditions
+inductor_config.coordinate_descent_tuning = True
+inductor_config.fx_graph_cache = True
+inductor_config.max_autotune = False
+inductor_config.shape_padding = False
+
+# Performance improvements
+inductor_config.triton.cudagraphs = True  # Enable CUDA graphs for kernel fusion
+inductor_config.epilogue_fusion = True  # Fuse epilogue operations
+inductor_config.pattern_matcher = True  # Enable pattern matching optimizations
+
 def get_local_model_path(model_name):
     hf_home = Path(os.environ.get('HF_HOME', Path.home() / '.cache' / 'huggingface'))
     model_cache = hf_home / 'hub' / f'models--{model_name.replace("/", "--")}'
@@ -57,10 +70,13 @@ class CasualSelfAttention(nn.Module):
         q = q.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         v = v.view(B,T, self.n_head, C//self.n_head).transpose(1,2)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2,-1)) * (1 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = -1)
-        y = att @ v
+        # att = (q @ k.transpose(-2,-1)) * (1 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = -1)
+        # y = att @ v
+        # -- flash attention : this method makes it so there's no reads/writes to HBM and everything is happening i shared memory because of online softmax calculation
+        y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
+
         y = y.transpose(1,2).contiguous().view(B,T,C)# reassemble all the head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -205,7 +221,7 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f'Loaded: {len(self.tokens)} tokens')
-        print(f'an epoch {len(self.tokens)// (B * T)} batches')
+        print(f'an epoch {len(self.tokens)// (accumulation_steps * B * T)} batches')
 
         # state
         self.current_position = 0
@@ -219,11 +235,32 @@ class DataLoaderLite:
         #if loading the next batch goes out of bound, reset
         if self.current_position + (B * T +1) > len(self.tokens):
             self.current_position = 0
+            # shuffle tokens at epoch boundary
+            perm = torch.randperm(len(self.tokens))
+            self.tokens = self.tokens[perm]
         return x, y
+
+def get_lr (step, max_steps, max_lr,min_lr,warmup_steps):
+    if step <  warmup_steps:
+        return max_lr * ((step + 1) / warmup_steps)
+    elif step >= max_steps:
+        return min_lr
+    else:
+        decay_ratio =  (step - warmup_steps) / (max_steps - warmup_steps)
+        coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
 
 
 num_return_sequences = 5
 max_length = 30
+# to simulate the batch 16 or 64 or etc but still not getting the OOM error
+accumulation_steps = 4
+max_steps = 50
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = max(1, max_steps // 10)
+
+import time
 
 device = "cpu"
 # get a data batch
@@ -234,21 +271,41 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(4,32)
-
+train_loader = DataLoaderLite(4,1024)
+torch.set_float32_matmul_precision('high')
 # model =GPT.from_pretrained('gpt2')
-model = GPT(GPT2Config())
+model = GPT(GPT2Config(vocab_size=50304))
+print(device)
 model.to(device)
+
+model = torch.compile(model)
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
-    x , y = train_loader.next_batch()
-    x , y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
+optimizer = torch.optim.AdamW(model.parameters(), lr = max_lr, betas=(0.9,0.95), eps = 1e-8,fused=True)
+for i in range(max_steps):
+    lr = get_lr(i, max_steps, max_lr, min_lr, warmup_steps)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    t0 = time.time()
+    optimizer.zero_grad(set_to_none=True)
+
+    loss_accum = 0.0
+    for _ in range(accumulation_steps):
+        x , y = train_loader.next_batch()
+        x , y = x.to(device), y.to(device)
+        with torch.amp.autocast(device_type= device, dtype= torch.bfloat16):
+            logits, loss = model(x, y)
+            # scaling the loss and in the loss_accum it will be added "accumulation_steps" times
+        loss = loss / accumulation_steps
+        loss_accum += loss.detach()
+        loss.backward()
     optimizer.step()
-    print(f"Step{i} the Loss is : {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = (accumulation_steps * train_loader.B * train_loader.T) / (dt/1000)
+    print(f"Step{i} the Loss is : {loss_accum.item()} , dt : {dt:.2f} ms tokens / sec : {tokens_per_sec:.2f}")
+
 
 import sys; sys.exit(0)
 
@@ -269,7 +326,7 @@ torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     # forward the model to get logits
     with torch.no_grad():
-        logits = model(x)
+        logits,_ = model(x)
         # take the logits at the last position
         logits = logits[:, -1, :]
         # get the probabilities
