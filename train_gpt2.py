@@ -3,8 +3,10 @@ import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from IPython.core.pylabtools import figsize
 from numpy import dtype
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
 import os
 from pathlib import Path
@@ -237,9 +239,11 @@ class GPT(nn.Module):
         return optimizer
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -251,17 +255,17 @@ class DataLoaderLite:
         print(f'an epoch {len(self.tokens)// (accumulation_steps * B * T)} batches')
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T *  self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]# +1 is to get the target token for the last token in the batch
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B,T)
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         #if loading the next batch goes out of bound, reset
-        if self.current_position + (B * T +1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes +1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
             # shuffle tokens at epoch boundary
             perm = torch.randperm(len(self.tokens))
             self.tokens = self.tokens[perm]
@@ -281,9 +285,7 @@ def get_lr (step, max_steps, max_lr,min_lr,warmup_steps):
 
 num_return_sequences = 5
 max_length = 30
-# to simulate the batch 16 or 64 or etc but still not getting the OOM error
-accumulation_steps = 4
-max_steps = 50
+max_steps = 5
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = max(1, max_steps // 10)
@@ -291,26 +293,57 @@ norm_history = []
 
 import time
 
-device = "cpu"
-# get a data batch
-if torch.cuda.is_available():
-    device = "cuda"
-
+#-------------------------------------------------------------------------------------------------------------------------
+from torch.distributed import init_process_group, destroy_process_group
+#set up  ddp( distributed data parallel)
+ddp = int(os.environ.get("RANK", -1)) != -1 # to verify if it's a ddp run
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to RANK
+    assert torch.cuda.is_available()
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do the logging, checking, printing etc.
+else:
+    # vanilla , no ddp run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to auto detect device
+    device = "cpu"
+    # get a data batch
+    if torch.cuda.is_available():
+        device = "cuda"
+#-------------------------------------------------------------------------------------------------------------------------
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(4,1024)
+# accumulation steps to be able to train on 0.5M batches so we can train the model faithful to the original parameters
+total_batch_size = 524288
+B = 8
+T = 1024
+assert total_batch_size % (B * T) == 0
+accumulation_steps = total_batch_size // (B * T * ddp_world_size)
+
+train_loader = DataLoaderLite(B,T , process_rank = ddp_rank, num_processes = ddp_world_size)
 torch.set_float32_matmul_precision('high')
 # model =GPT.from_pretrained('gpt2')
 model = GPT(GPT2Config(vocab_size=50304))
 print(device)
 model.to(device)
-
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contain the "raw" unwrapped model
+
 #optimize
 # optimizer = torch.optim.AdamW(model.parameters(), lr = max_lr, betas=(0.9,0.95), eps = 1e-8,fused=True)
-optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = max_lr, device= device)
+optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = max_lr, device= device)
 for i in range(max_steps):
     lr = get_lr(i, max_steps, max_lr, min_lr, warmup_steps)
     for param_group in optimizer.param_groups:
@@ -320,7 +353,7 @@ for i in range(max_steps):
     optimizer.zero_grad(set_to_none=True)
 
     loss_accum = 0.0
-    for _ in range(accumulation_steps):
+    for micro_step in range(accumulation_steps):
         x , y = train_loader.next_batch()
         x , y = x.to(device), y.to(device)
         with torch.amp.autocast(device_type= device, dtype= torch.bfloat16):
@@ -328,16 +361,23 @@ for i in range(max_steps):
             # scaling the loss and in the loss_accum it will be added "accumulation_steps" times
         loss = loss / accumulation_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync(micro_step == accumulation_steps - 1)
         loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         norm_history.append(norm.item())
     optimizer.step()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize()# wait for GPU to finish
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (accumulation_steps * train_loader.B * train_loader.T) / (dt/1000)
-    print(f"Step{i} | the Loss is : {loss_accum.item():.6f} | norm:{norm:.4f} | dt : {dt:.2f} ms | tokens / sec : {tokens_per_sec:.2f}")
+    tokens_per_sec = (accumulation_steps * train_loader.B * train_loader.T * ddp_world_size) / (dt/1000)
+    if master_process:
+        print(f"Step{i} | the Loss is : {loss_accum.item():.6f} | norm:{norm:.4f} | dt : {dt:.2f} ms | tokens / sec : {tokens_per_sec:.2f}")
 
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 
