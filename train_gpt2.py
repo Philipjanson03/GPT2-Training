@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import numpy as np
 from IPython.core.pylabtools import figsize
 from numpy import dtype
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -237,24 +238,37 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, weight_decay=weight_decay, betas=(0.9, 0.95),
                                       eps=1e-8, fused=use_fused)
         return optimizer
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
 
         # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f'Loaded: {len(self.tokens)} tokens')
-        print(f'an epoch {len(self.tokens)// (accumulation_steps * B * T)} batches')
+        # data_root = 'edu_fineweb10B'
+        data_root = 'C:/training_data/finsight/tokens/phase3_persian'
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root,s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f'no shards found for split {split}'
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
-        # state
+    def reset(self):
+        # state , init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T *  self.process_rank
 
     def next_batch(self):
@@ -263,9 +277,11 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B,T)
         self.current_position += B * T * self.num_processes
-        #if loading the next batch goes out of bound, reset
+        #if loading the next batch goes out of bound, advance to next shard
         if self.current_position + (B * T * self.num_processes +1) > len(self.tokens):
             self.current_position = self.B * self.T * self.process_rank
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             # shuffle tokens at epoch boundary
             perm = torch.randperm(len(self.tokens))
             self.tokens = self.tokens[perm]
@@ -285,15 +301,22 @@ def get_lr (step, max_steps, max_lr,min_lr,warmup_steps):
 
 num_return_sequences = 5
 max_length = 30
+# number of steps to validate the performance on laptop
 max_steps = 5
+# # steps for the final training
+# max_steps = 19073
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = max(1, max_steps // 10)
+## ideal warmup steps is 10% of the max steps
+# warmup_steps = max(1, max_steps // 10)
+# warm up schedule GPT-3 used
+warmup_steps = 715
 norm_history = []
 
 import time
 
 #-------------------------------------------------------------------------------------------------------------------------
+# torchrun --standalone --nproc-per-node=8 train_gpt2.py
 from torch.distributed import init_process_group, destroy_process_group
 #set up  ddp( distributed data parallel)
 ddp = int(os.environ.get("RANK", -1)) != -1 # to verify if it's a ddp run
@@ -330,13 +353,17 @@ T = 1024
 assert total_batch_size % (B * T) == 0
 accumulation_steps = total_batch_size // (B * T * ddp_world_size)
 
-train_loader = DataLoaderLite(B,T , process_rank = ddp_rank, num_processes = ddp_world_size)
+train_loader = DataLoaderLite(B= B,T= T , process_rank = ddp_rank, num_processes = ddp_world_size, split='train')
+val_loader = DataLoaderLite(B= B, T= T, process_rank = ddp_rank, num_processes = ddp_world_size, split='val')
 torch.set_float32_matmul_precision('high')
 # model =GPT.from_pretrained('gpt2')
 model = GPT(GPT2Config(vocab_size=50304))
 print(device)
 model.to(device)
+
+# for evaluation and generating samples you might need to disable the compilation
 model = torch.compile(model)
+
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contain the "raw" unwrapped model
@@ -350,8 +377,70 @@ for i in range(max_steps):
         param_group['lr'] = lr
 
     t0 = time.time()
-    optimizer.zero_grad(set_to_none=True)
+    if i % 100 == 0:
+        raw_model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.amp.autocast(device_type= device, dtype= torch.bfloat16):
+                    logits, loss = raw_model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f'validation loss: {val_loss_accum.item():.4f}')
 
+    if master_process and i % 500 == 0:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'step': i,
+            'val_loss': val_loss_accum.item() if 'val_loss_accum' in dir() else None,
+        }
+        torch.save(checkpoint, f'checkpoint_step{i}.pt')
+    torch._dynamo.disable(raw_model)
+    if i > 0 and i % 100 == 0:
+        raw_model.eval()
+        enc = GPT2Tokenizer.from_pretrained(get_local_model_path('gpt2'))
+        tokens = enc.encode("Hello I am a Language model and i am capable of")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device= device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        with torch.no_grad():
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                logits , loss = raw_model(xgen)
+
+                logits = logits [:, -1, :]
+
+                probs = F.softmax(logits, dim=-1)
+
+                topk_probs, topk_indicies = torch.topk(probs, 50, dim=-1)
+
+                ix = torch.multinomial(topk_probs, 1 , generator=sample_rng)
+
+                x_col = torch.gather(topk_indicies, -1, ix)
+
+                xgen = torch.cat((xgen, x_col ), dim = 1)
+
+        for seq_idx in range (num_return_sequences):
+            tokens = xgen[seq_idx, :max_length].tolist()
+            decode = enc.decode(tokens)
+            print(f'rank{ddp_rank} sample {seq_idx}:  {decode}')
+
+    torch._dynamo.enable(raw_model)
+
+
+    # training loop
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
     for micro_step in range(accumulation_steps):
         x , y = train_loader.next_batch()
@@ -364,10 +453,10 @@ for i in range(max_steps):
         if ddp:
             model.require_backward_grad_sync(micro_step == accumulation_steps - 1)
         loss.backward()
-        if ddp:
-            dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_history.append(norm.item())
+    if ddp:
+        dist.all_reduce(loss_accum, op = dist.ReduceOp.AVG)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm_history.append(norm.item())
     optimizer.step()
     torch.cuda.synchronize()# wait for GPU to finish
     t1 = time.time()
